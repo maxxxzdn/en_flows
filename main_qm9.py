@@ -16,6 +16,8 @@ from qm9.analyze import analyze_stability_for_molecules
 from qm9.utils import prepare_context
 from qm9.sampling import sample_chain, sample
 
+from qm9 import mol_dim
+
 
 parser = argparse.ArgumentParser(description='SE3')
 parser.add_argument('--exp_name', type=str, default='debug_10')
@@ -62,6 +64,7 @@ parser.add_argument('--generate_epochs', type=int, default=1,
                     help='save model')
 parser.add_argument('--num_workers', type=int, default=0, help='Number of worker for the dataloader')
 parser.add_argument('--test_epochs', type=int, default=1)
+parser.add_argument('--physics', type=int, default=0, help='Minimize energy loss or not')
 parser.add_argument('--data_augmentation', type=eval, default=False,
                     help='use attention in the EGNN')
 parser.add_argument('--x_aggregation', type=str, default='sum',
@@ -105,7 +108,7 @@ print(args)
 
 
 # Log all args to wandb
-wandb.init(entity=args.wandb_usr, project='se3flows_qm9', name=args.exp_name, config=args)
+wandb.init(entity='aipp', project='eegVAE', name=args.exp_name, config=args)
 wandb.save('*.txt')
 
 # Retrieve QM9 dataloaders
@@ -122,7 +125,6 @@ else:
     context_node_nf = 0
 
 args.context_node_nf = context_node_nf
-
 
 # Create EGNN flow
 prior, flow, dequantizer, nodes_dist = get_model(args, device)
@@ -166,32 +168,38 @@ def train_epoch(loader, epoch, flow, flow_dp):
             context = None
 
         optim.zero_grad()
-
-        # transform batch through flow
+        
+        if args.physics:         
+            energy_loss = mol_dim.compute_energy_loss(dequantizer, flow, prior,
+                        nodes_dist, x.clone(), node_mask, edge_mask, context)
+        else:
+            energy_loss = 0
+            
         nll, reg_term, mean_abs_z = losses.compute_loss_and_nll(args, dequantizer, flow_dp, prior, nodes_dist, x, h,
                                                                 node_mask, edge_mask, context)
-        # standard nll from forward KL
-
-        loss = nll + args.ode_regularization * reg_term
-
-        loss.backward()
+                
+        loss = 0.01*energy_loss + nll + args.ode_regularization * reg_term
 
         if args.clip_grad:
             grad_norm = utils.gradient_clipping(flow, gradnorm_queue)
         else:
             grad_norm = 0.
 
-        optim.step()
-
         if i % args.n_report_steps == 0:
             print(f"\repoch: {epoch}, iter: {i}/{len(loader)}, "
                   f"Loss {loss.item():.2f}, NLL: {nll.item():.2f}, "
                   f"RegTerm: {reg_term.item():.1f}, "
+                  f"PhysTerm: {energy_loss.item():.1f}, "
                   f"GradNorm: {grad_norm:.1f}")
+            
+        loss.backward()
+        
+        optim.step()
 
         nll_epoch.append(nll.item())
 
-        if i % 100 == 0:
+        if i % 100 == 0 and i!=0:
+            analyze_and_save(epoch)
             save_and_sample_chain(epoch=epoch)
             sample_different_sizes_and_save(epoch=epoch)
             vis.visualize("outputs/%s/epoch_%d" % (args.exp_name, epoch), wandb=wandb)
@@ -201,6 +209,7 @@ def train_epoch(loader, epoch, flow, flow_dp):
 
         wandb.log({"mean(abs(z))": mean_abs_z}, commit=False)
         wandb.log({"Batch NLL": nll.item()}, commit=True)
+        wandb.log({"Energy": energy_loss.item()}, commit=True)
 
         if args.break_train_epoch:
             break
